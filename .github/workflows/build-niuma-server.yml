@@ -1,0 +1,72 @@
+name: Build Niuma Server
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Download inspected source
+      uses: actions/checkout@v4
+      with:
+        repository: rainchestnut/niuma
+        ref: a6d214aabfdc7e308881848c95ce74108baabbb3
+        path: source
+        persist-credentials: false
+    - name: Prepare deployment files
+      run: |
+        python3 <<'PY'
+        from pathlib import Path
+        root = Path('deployment')
+        root.mkdir(exist_ok=True)
+        (root / 'Dockerfile').write_text('FROM rust:1-bookworm AS builder\nWORKDIR /build\nCOPY niuma-server/ ./\nRUN cargo build --locked --release\n\nFROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* && useradd --uid 10001 --create-home niuma && mkdir -p /data/logs /data/transfers && chown -R niuma:niuma /data\nCOPY --from=builder /build/target/release/niuma-server /usr/local/bin/niuma-server\nUSER niuma\nWORKDIR /data\nEXPOSE 8000\nENTRYPOINT ["/usr/local/bin/niuma-server"]\n', encoding='utf-8')
+        (root / 'compose.yaml').write_text('name: niuma\nservices:\n  database:\n    image: postgres:17-bookworm\n    restart: unless-stopped\n    environment:\n      POSTGRES_DB: niuma\n      POSTGRES_USER: niuma\n      POSTGRES_PASSWORD: ${NIUMA_DB_PASSWORD:?Run start.sh first}\n    volumes:\n      - database:/var/lib/postgresql/data\n    healthcheck:\n      test: ["CMD-SHELL", "pg_isready -U niuma -d niuma"]\n      interval: 5s\n      timeout: 3s\n      retries: 20\n    mem_limit: 256m\n    logging:\n      driver: json-file\n      options:\n        max-size: 10m\n        max-file: "3"\n  server:\n    image: niuma-server:selfhost-a6d214a\n    restart: unless-stopped\n    depends_on:\n      database:\n        condition: service_healthy\n    environment:\n      NIUMA_HOST: 0.0.0.0\n      NIUMA_PORT: "8000"\n      NIUMA_DATABASE_URL: postgresql://niuma:${NIUMA_DB_PASSWORD:?Run start.sh first}@database:5432/niuma\n      NIUMA_DATABASE_POOL_SIZE: "3"\n      NIUMA_LOG_DIR: /data/logs\n      NIUMA_TRANSFER_STORAGE_DIR: /data/transfers\n    ports:\n      - "127.0.0.1:18000:8000"\n    volumes:\n      - server-data:/data\n    healthcheck:\n      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/healthz"]\n      interval: 10s\n      timeout: 3s\n      retries: 12\n      start_period: 15s\n    mem_limit: 384m\n    stop_signal: SIGINT\n    logging:\n      driver: json-file\n      options:\n        max-size: 10m\n        max-file: "3"\nvolumes:\n  database:\n  server-data:\n', encoding='utf-8')
+        (root / 'start.sh').write_text('#!/usr/bin/env bash\nset -euo pipefail\ncd -- "$(dirname -- "$0")"\nif [[ ! -f .env ]]; then\n  umask 077\n  password=$(od -An -N32 -tx1 /dev/urandom | tr -d \' \\n\')\n  printf \'NIUMA_DB_PASSWORD=%s\\n\' "$password" > .env\nfi\ndocker compose config --quiet\nif [[ -f images.tar.gz ]]; then\n  sha256sum --check SHA256SUMS.txt\n  gzip -dc images.tar.gz | docker load\nfi\ndocker compose up -d --pull never --wait --wait-timeout 180\ndocker compose ps\ncurl --fail --silent --show-error http://127.0.0.1:18000/healthz\nprintf \'\\nNiuma is listening on 127.0.0.1:18000\\n\'\n', encoding='utf-8')
+        PY
+    - name: Build Linux image
+      run: |
+        set -euo pipefail
+        docker build -f deployment/Dockerfile -t niuma-server:selfhost-a6d214a source
+        docker pull postgres:17-bookworm
+    - name: Test database and server together
+      working-directory: deployment
+      run: |
+        set -euo pipefail
+        export NIUMA_DB_PASSWORD=ci_test_password_only
+        docker compose config --quiet
+        docker compose up -d --pull never --wait --wait-timeout 180
+        curl --fail --silent --show-error http://127.0.0.1:18000/healthz
+    - name: Save container logs
+      if: always()
+      working-directory: deployment
+      run: docker compose logs --no-color > smoke-test.log 2>&1 || true
+      env:
+        NIUMA_DB_PASSWORD: ci_test_password_only
+    - name: Export images for offline server installation
+      run: |
+        set -euo pipefail
+        docker save niuma-server:selfhost-a6d214a postgres:17-bookworm | gzip -1 > deployment/images.tar.gz
+        cd deployment
+        sha256sum images.tar.gz > SHA256SUMS.txt
+        chmod +x start.sh
+    - name: Upload deployment package
+      uses: actions/upload-artifact@v4
+      with:
+        name: Niuma-server-deploy
+        path: deployment/
+        retention-days: 7
+        compression-level: 0
+        if-no-files-found: error
+    - name: Upload failure diagnostics
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Niuma-server-build-logs
+        path: deployment/smoke-test.log
+        if-no-files-found: ignore
+        retention-days: 7
