@@ -38,6 +38,116 @@ jobs:
         text = text.replace(needle, 'os_type: if cfg!(target_os = "macos") { "darwin" } else { std::env::consts::OS }.to_string(),')
         path.write_text(text, encoding='utf-8')
         PY
+    - name: Adapt modern Codex project metadata and keep connection alive
+      shell: bash
+      run: |
+        python <<'PY'
+        from pathlib import Path
+
+        base = Path('source/niuma-cli/src')
+        path = base / 'metadata.rs'
+        text = path.read_text(encoding='utf-8')
+        old = '''        serde_json::from_str(&payload).unwrap_or_else(|_| empty_state())'''
+        new = '''        let Ok(mut value) = serde_json::from_str::<Value>(&payload) else {
+                    return empty_state();
+                };
+                // Newer Codex desktop versions store project ids in project-order,
+                // and resolve their actual workspace paths through local-projects.
+                // Adapt a copy in memory; never rewrite Codex's state file.
+                if let Some(local_projects) = value.get("local-projects").and_then(Value::as_object).cloned() {
+                    let mut ids: Vec<String> = value.get("project-order")
+                        .and_then(Value::as_array)
+                        .into_iter().flatten().filter_map(Value::as_str)
+                        .map(str::to_string).collect();
+                    ids.extend(local_projects.keys().cloned());
+                    let mut seen = std::collections::HashSet::new();
+                    let mut roots = Vec::new();
+                    let mut labels = value.get("electron-workspace-root-labels")
+                        .and_then(Value::as_object).cloned().unwrap_or_default();
+                    for id in ids {
+                        if let Some(project) = local_projects.get(&id) {
+                            for root in project.get("rootPaths").and_then(Value::as_array)
+                                .into_iter().flatten().filter_map(Value::as_str)
+                            {
+                                if root.trim().is_empty() { continue; }
+                                let root = normalize_root(root);
+                                if seen.insert(root.clone()) {
+                                    if let Some(name) = project.get("name").and_then(Value::as_str)
+                                        .filter(|name| !name.is_empty())
+                                    {
+                                        labels.insert(root.clone(), json!(name));
+                                    }
+                                    roots.push(root);
+                                }
+                            }
+                        } else if PathBuf::from(&id).is_absolute() {
+                            // Retain path entries in mixed old/new desktop snapshots.
+                            let root = normalize_root(&id);
+                            if seen.insert(root.clone()) { roots.push(root); }
+                        }
+                    }
+                    value["project-order"] = json!(roots);
+                    value["electron-workspace-root-labels"] = Value::Object(labels);
+                }
+                serde_json::from_value(value).unwrap_or_else(|_| empty_state())'''
+        assert text.count(old) == 1
+        text = text.replace(old, new)
+        test = r'''
+            #[test]
+            fn workspace_store_reads_modern_project_ids_without_modifying_source() {
+                let root = std::env::temp_dir().join(format!("niuma-modern-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&root).unwrap();
+                let first = root.join("first").to_string_lossy().into_owned();
+                let second = root.join("second").to_string_lossy().into_owned();
+                let state_path = root.join("state.json");
+                let original = serde_json::to_string(&json!({
+                    "project-order": ["project-b", "missing-project", "project-a"],
+                    "local-projects": {
+                        "project-a": {"name": "First", "rootPaths": [first, ""]},
+                        "project-b": {"name": "Second", "rootPaths": [second, first]}
+                    },
+                    "projectless-thread-ids": ["thread-one"]
+                })).unwrap();
+                std::fs::write(&state_path, &original).unwrap();
+                let store = CodexWorkspaceStore { global_state_path: state_path.clone() };
+                let projects = store.list_projects();
+                assert_eq!(projects.len(), 2);
+                assert_eq!(projects[0].cwd.as_deref(), Some(normalize_root(&second).as_str()));
+                assert_eq!(projects[1].cwd.as_deref(), Some(normalize_root(&first).as_str()));
+                assert_eq!(projects[0].project_name, "Second");
+                assert_eq!(store.list_projectless_thread_ids(), vec!["thread-one"]);
+                assert_eq!(std::fs::read_to_string(&state_path).unwrap(), original);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+
+        '''
+        anchor = '    #[test]\n    fn workspace_store_orders_and_deduplicates_roots()'
+        assert text.count(anchor) == 1
+        text = text.replace(anchor, test + anchor)
+        old_expected = 'vec!["/tmp/a", "/tmp/b", "/tmp/c"]'
+        new_expected = 'vec![normalize_root("/tmp/a"), normalize_root("/tmp/b"), normalize_root("/tmp/c")]'
+        assert text.count(old_expected) == 1
+        text = text.replace(old_expected, new_expected)
+        path.write_text(text, encoding='utf-8')
+
+        path = base / 'realtime.rs'
+        text = path.read_text(encoding='utf-8')
+        old = '''        .map(CodexAppServerClient::subscribe_notifications);
+            loop {
+                tokio::select! {'''
+        new = '''        .map(CodexAppServerClient::subscribe_notifications);
+            // A ping receives an automatic pong from Axum, keeping nginx's
+            // upstream read timeout from closing an otherwise idle connection.
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        writer.send(Message::Ping(Vec::new().into())).await?;
+                    }'''
+        assert text.count(old) == 1
+        text = text.replace(old, new)
+        path.write_text(text, encoding='utf-8')
+        PY
     - name: Select stable Rust
       run: |
         rustup update stable --no-self-update
@@ -49,6 +159,10 @@ jobs:
     - name: Verify encryption tests
       run: |
         cargo test --locked --manifest-path source/niuma-cli/Cargo.toml crypto::tests
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    - name: Verify old and new project metadata formats
+      run: |
+        cargo test --locked --manifest-path source/niuma-cli/Cargo.toml workspace_store_
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Build Windows gateway
       run: |
