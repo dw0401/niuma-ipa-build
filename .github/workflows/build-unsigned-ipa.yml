@@ -59,7 +59,7 @@ jobs:
           executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
           platform=$(/usr/libexec/PlistBuddy -c 'Print :DTPlatformName' "$app/Info.plist")
           test "$platform" = iphoneos
-          xcrun lipo -verify_arch arm64 "$app/$executable"
+          xcrun lipo "$app/$executable" -verify_arch arm64
           if [[ -e "$app/_CodeSignature" || -e "$app/embedded.mobileprovision" ]]; then
             echo "Unexpected signing data"
             exit 1
