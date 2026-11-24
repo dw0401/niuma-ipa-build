@@ -148,6 +148,152 @@ jobs:
         text = text.replace(old, new)
         path.write_text(text, encoding='utf-8')
         PY
+    - name: Fix notification replay feedback loop
+      shell: bash
+      run: |
+        python <<'PY'
+        from pathlib import Path
+
+        base = Path('source/niuma-cli/src')
+        path = base / 'tasks.rs'
+        text = path.read_text(encoding='utf-8')
+        old = '''        let thread_payload = self
+                    .app_server
+                    .resume_thread_payload(&message.thread_id, None, None, None, None)
+                    .await
+                    .unwrap_or_else(|_| json!({ "id": message.thread_id }));
+                let replay_payload = self
+                    .app_server
+                    .read_thread_payload(&message.thread_id, true)
+                    .await
+                    .unwrap_or(thread_payload);'''
+        new = '''        // History projection is read-only. Resuming here generates new
+                // lifecycle notifications and can feed this replay path indefinitely.
+                // Actual mobile task submission still resumes in start_task_messages.
+                let replay_payload = self
+                    .app_server
+                    .read_thread_payload(&message.thread_id, true)
+                    .await?;'''
+        assert text.count(old) == 1
+        text = text.replace(old, new)
+        anchor = '    #[test]\n    fn conversation_project_route_omits_workspace_cwd()'
+        test = r'''    #[tokio::test]
+            async fn history_replay_reads_without_resuming_or_swallowing_errors() {
+                crate::paths::ensure_state_dirs().unwrap();
+                let root = std::env::temp_dir().join(format!("niuma-replay-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&root).unwrap();
+                let script = root.join("fake_server.py");
+                let requests = root.join("requests.txt");
+                std::fs::write(&script, r#"
+        import json, sys
+        for line in sys.stdin:
+            message = json.loads(line)
+            if 'id' not in message:
+                continue
+            method = message['method']
+            with open(sys.argv[1], 'a') as f:
+                f.write(method + '\n')
+            if method == 'initialize':
+                response = {'result': {}}
+            elif method == 'thread/read' and message['params']['threadId'] == 'missing':
+                response = {'error': {'code': -32600, 'message': 'missing thread'}}
+            elif method == 'thread/read':
+                print(json.dumps({'method': 'deprecationNotice', 'params': {'threadId': 'test-thread'}}), flush=True)
+                response = {'result': {'thread': {'id': 'test-thread', 'turns': []}}}
+            else:
+                response = {'error': {'code': -32601, 'message': 'unexpected mutation: ' + method}}
+            response['id'] = message['id']
+            print(json.dumps(response), flush=True)
+        "#).unwrap();
+                let client = CodexAppServerClient::start(&[
+                    "python".to_string(), script.to_string_lossy().into_owned(),
+                    requests.to_string_lossy().into_owned(),
+                ]).await.unwrap();
+                let identity = AgentIdentity {
+                    agent_id: "agent".into(), device_name: "test".into(), os_type: "windows".into(),
+                    signing_private_key: String::new(), signing_public_key: String::new(),
+                    signing_key_fingerprint: String::new(), encryption_private_key: String::new(),
+                    encryption_public_key: String::new(), encryption_key_fingerprint: String::new(),
+                };
+                let runtime = TaskRuntime::new(identity, client, None);
+                let inbound = |thread_id: &str| ResumeThreadInbound {
+                    request_id: None, device_id: "phone".into(), thread_id: thread_id.into(),
+                    cursor: 0, checkpoint: None,
+                };
+                runtime.resume_thread_messages(inbound("test-thread")).await.unwrap();
+                assert!(runtime.resume_thread_messages(inbound("missing")).await.is_err());
+                let methods = std::fs::read_to_string(&requests).unwrap();
+                assert_eq!(methods.lines().collect::<Vec<_>>(),
+                    vec!["initialize", "thread/read", "thread/read"]);
+                drop(runtime);
+                let _ = std::fs::remove_dir_all(root);
+            }
+
+        '''
+        assert text.count(anchor) == 1
+        text = text.replace(anchor, test + anchor)
+        path.write_text(text, encoding='utf-8')
+
+        path = base / 'realtime.rs'
+        text = path.read_text(encoding='utf-8')
+        anchor = 'async fn handle_app_server_event<S, E>('
+        helper = '''// Read-only queries can emit deprecation, token-usage and goal notices.
+        // Only events that change visible turn/item content need history replay.
+        fn notification_requires_history_replay(event: &Value) -> bool {
+            match notification_method(event) {
+                Some("turn/started" | "turn/completed") => true,
+                Some(method) if method.starts_with("item/") => true,
+                _ => false,
+            }
+        }
+
+        '''
+        assert text.count(anchor) == 1
+        text = text.replace(anchor, helper + anchor)
+        old = '''    let Some(thread_id) = notification_thread_id(&event) else {
+                return Ok(());
+            };
+            let Some(active) = runtime.active_threads.read().await.get(&thread_id).cloned() else {'''
+        new = '''    if !notification_requires_history_replay(&event) {
+                return Ok(());
+            }
+            let Some(thread_id) = notification_thread_id(&event) else {
+                return Ok(());
+            };
+            let Some(active) = runtime.active_threads.read().await.get(&thread_id).cloned() else {'''
+        assert text.count(old) == 1
+        text = text.replace(old, new)
+        anchor = '    #[test]\n    fn agent_ws_url_preserves_reverse_proxy_prefix()'
+        test = '''    #[test]
+            fn history_replay_ignores_read_and_resume_side_effects() {
+                for method in ["deprecationNotice", "thread/tokenUsage/updated",
+                    "thread/goal/cleared", "thread/started", "thread/status/changed"] {
+                    let event = json!({"method": method, "params": {"threadId": "thread-one"}});
+                    assert!(!super::notification_requires_history_replay(&event), "{method}");
+                }
+                for method in ["turn/started", "turn/completed", "item/started",
+                    "item/completed", "item/agentMessage/delta"] {
+                    let event = json!({"method": method, "params": {"threadId": "thread-one"}});
+                    assert!(super::notification_requires_history_replay(&event), "{method}");
+                }
+            }
+
+        '''
+        assert text.count(anchor) == 1
+        text = text.replace(anchor, test + anchor)
+        path.write_text(text, encoding='utf-8')
+
+        # stdout is captured by the Windows launcher. Keep routine protocol traffic
+        # in the bounded daily JSON logs, without a second unbounded stdout copy.
+        path = base / 'logging.rs'
+        text = path.read_text(encoding='utf-8')
+        text = text.replace('use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};',
+            'use tracing_subscriber::{EnvFilter, Layer, filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};')
+        text = text.replace('let stdout_layer = fmt::layer().with_target(true);',
+            'let stdout_layer = fmt::layer().with_target(true).with_filter(LevelFilter::WARN);')
+        text = text.replace('.filename_suffix("jsonl")', '.filename_suffix("jsonl")\n        .max_log_files(3)')
+        path.write_text(text, encoding='utf-8')
+        PY
     - name: Select stable Rust
       run: |
         rustup update stable --no-self-update
@@ -163,6 +309,10 @@ jobs:
     - name: Verify old and new project metadata formats
       run: |
         cargo test --locked --manifest-path source/niuma-cli/Cargo.toml workspace_store_
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    - name: Test read-only replay and notification feedback regression
+      run: |
+        cargo test --locked --manifest-path source/niuma-cli/Cargo.toml history_replay_ -- --test-threads=1
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Build Windows gateway
       run: |
