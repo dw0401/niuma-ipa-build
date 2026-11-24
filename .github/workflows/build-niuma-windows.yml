@@ -476,6 +476,111 @@ jobs:
         text = text.replace(anchor, branch + anchor)
         path.write_text(text, encoding='utf-8')
         PY
+    - name: Project Windows generated images into mobile attachments
+      shell: bash
+      run: |
+        python <<'PY'
+        from pathlib import Path
+
+        base = Path('source/niuma-cli/src')
+        p = base / 'codex_projection.rs'
+        s = p.read_text(encoding='utf-8')
+        old = r'data:image/[^>]+|file://[^>]+|/[^>]+'
+        new = r'data:image/[^>]+|file://[^>]+|[A-Za-z]:[\/][^>]+|/[^>]+'
+        assert s.count(old) == 1
+        s = s.replace(old, new)
+        old = r'data:image/[^)]+|file://[^)]+|/[^)]+'
+        new = r'data:image/[^)]+|file://[^)]+|[A-Za-z]:[\/][^)]+|/[^)]+'
+        assert s.count(old) == 1
+        s = s.replace(old, new)
+        old = '''    } else if raw_url.starts_with('/') {
+                raw_url.to_string()'''
+        new = '''    } else if raw_url.starts_with('/') || std::path::Path::new(raw_url).is_absolute() {
+                raw_url.to_string()'''
+        assert s.count(old) == 1
+        s = s.replace(old, new)
+        old = r'(?P<ref>file://[^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp)|/[^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp))'
+        new = r'(?P<ref>file://[^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp)|[A-Za-z]:[\/][^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp)|/[^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp))'
+        assert s.count(old) == 1
+        s = s.replace(old, new)
+        anchor = '    #[test]\n    fn markdown_local_image_link_becomes_file_ref()'
+        test = r'''    #[cfg(windows)]
+            #[test]
+            fn windows_generated_image_links_become_transfer_parts() {
+                crate::file_access::configure_test_roots(
+                    vec![std::env::temp_dir().to_string_lossy().into_owned()],
+                    crate::file_access::FileAccessStatus::Granted,
+                );
+                let path = write_test_png_with_spaces("generated image");
+                let forward = path.to_string_lossy().replace('\\', "/");
+                for reference in [forward, path.to_string_lossy().into_owned()] {
+                    for text in [format!("![Generated photo]({reference})"),
+                        format!("![Generated photo](<{reference}>)")] {
+                        let parts = content_parts_from_text(&text);
+                        let image = parts.iter().find(|part| part["file_type"] == "image")
+                            .expect("Windows image path must become a transferable file part");
+                        assert_eq!(image["type"], "file_ref");
+                        assert_eq!(image["mime_type"], "image/png");
+                        assert!(image["data_url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+                    }
+                }
+                assert!(local_path_from_ref("https://example.com/photo.png").is_none());
+                assert!(local_path_from_ref("relative/photo.png").is_none());
+                std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+            }
+
+        '''
+        # Rust char syntax uses one escaped backslash.
+        test = test.replace(chr(92) * 4, chr(92) * 2)
+        assert s.count(anchor) == 1
+        s = s.replace(anchor, test + anchor)
+        p.write_text(s, encoding='utf-8')
+
+        # Reproject existing image rows on explicit mobile refresh so older rows
+        # received as plain Markdown can be enriched, keeping stable entry ids.
+        p = base / 'tasks.rs'
+        s = p.read_text(encoding='utf-8')
+        old = '''            replay_events_from_thread(&replay_payload, message.cursor, &context)
+                        .into_iter()
+                        .map(|event| event.into_wire(&message.device_id))'''
+        new = '''            replay_events_from_thread(&replay_payload,
+                        if message.request_id.is_some() { 0 } else { message.cursor }, &context)
+                        .into_iter()
+                        .filter(|event| event.seq > message.cursor || (
+                            message.request_id.is_some() && serde_json::from_str::<Value>(&event.ciphertext)
+                                .ok().and_then(|value| value.get("content_parts").and_then(Value::as_array).cloned())
+                                .is_some_and(|parts| parts.iter().any(|part|
+                                    part.get("file_type").and_then(Value::as_str) == Some("image")
+                                    && part.get("data_url").and_then(Value::as_str).is_some()))))
+                        .map(|event| event.into_wire(&message.device_id))'''
+        assert s.count(old) == 1
+        s = s.replace(old, new)
+        p.write_text(s, encoding='utf-8')
+
+        p = base / 'realtime.rs'
+        s = p.read_text(encoding='utf-8')
+        old = '''        .max()
+                .unwrap_or(fallback_cursor)
+        }'''
+        new = '''        .max()
+                .unwrap_or(fallback_cursor)
+                .max(fallback_cursor)
+        }'''
+        assert s.count(old) == 1
+        s = s.replace(old, new)
+        anchor = '    #[test]\n    fn agent_ws_url_preserves_reverse_proxy_prefix()'
+        test = '''    #[test]
+            fn enriched_image_rows_do_not_rewind_mobile_cursor() {
+                let completion = thread_sync_completed(None, "phone", "thread", 20, None,
+                    &[json!({"seq": 3, "entry_id": "existing-image"})]);
+                assert_eq!(completion["cursor"], 20);
+            }
+
+        '''
+        assert s.count(anchor) == 1
+        s = s.replace(anchor, test + anchor)
+        p.write_text(s, encoding='utf-8')
+        PY
     - name: Select stable Rust
       run: |
         rustup update stable --no-self-update
@@ -499,6 +604,14 @@ jobs:
     - name: Test stale thread recovery and error handling
       run: |
         cargo test --locked --manifest-path source/niuma-cli/Cargo.toml stale_projectless_reference -- --test-threads=1
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    - name: Verify Windows image conversion and existing-row refresh
+      run: |
+        cargo test --locked --manifest-path source/niuma-cli/Cargo.toml windows_generated_image_links -- --test-threads=1
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        cargo test --locked --manifest-path source/niuma-cli/Cargo.toml markdown_local_image_link -- --test-threads=1
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        cargo test --locked --manifest-path source/niuma-cli/Cargo.toml enriched_image_rows -- --test-threads=1
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Build Windows gateway
       run: |
