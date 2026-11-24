@@ -1,12 +1,6 @@
-
 name: Build Niuma Unsigned IPA
-
-on:
-  workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
   build:
     runs-on: macos-26
@@ -15,68 +9,227 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Download source
-        uses: actions/checkout@v4
-        with:
-          repository: rainchestnut/niuma
-          ref: a6d214aabfdc7e308881848c95ce74108baabbb3
-          path: source
-          persist-credentials: false
+    - name: Fetch inspected upstream source
+      uses: actions/checkout@v4
+      with:
+        repository: rainchestnut/niuma
+        ref: a6d214aabfdc7e308881848c95ce74108baabbb3
+        path: source
+        persist-credentials: false
+    - name: Add original-image Photos save and sharing actions
+      run: |
+        python3 <<'PY'
+        from pathlib import Path
 
-      - name: Select Xcode
-        run: |
-          set -euo pipefail
-          mkdir -p output
-          if [[ -d /Applications/Xcode_26.4.1.app ]]; then
-            sudo xcode-select --switch /Applications/Xcode_26.4.1.app/Contents/Developer
-          fi
-          xcodebuild -version
+        root = Path('source/niuma-ios')
+        path = root / 'niuma/Features/Threads/ThreadImageAttachments.swift'
+        text = path.read_text(encoding='utf-8')
+        anchor = '''                .accessibilityIdentifier("thread-external-image-thumbnail")'''
+        assert text.count(anchor) == 1
+        text = text.replace(anchor, anchor + '''
+                        .modifier(ImageExportActions(data: localData, language: appModel.appLanguage))''')
+        anchor = '''        .task(id: loadIdentifier) {
+                    await loadImage()
+                }
+            }'''
+        # Each of the three image views has this task. Add actions to preview and
+        # inline image container; thumbnail already has actions on its button.
+        assert text.count(anchor) == 3
+        parts = text.split(anchor)
+        text = parts[0] + anchor + parts[1] + '''        .modifier(ImageExportActions(data: localData, language: appModel.appLanguage, showsButton: true))
+        ''' + anchor + parts[2] + '''        .modifier(ImageExportActions(data: rawData, language: language))
+        ''' + anchor + parts[3]
+        path.write_text(text, encoding='utf-8')
 
-      - name: Build unsigned iPhone app
-        run: |
-          set -euo pipefail
-          xcodebuild \
-            -project source/niuma-ios/niuma.xcodeproj \
-            -scheme niuma \
-            -configuration Release \
-            -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath "$RUNNER_TEMP/niuma-derived" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY= \
-            DEVELOPMENT_TEAM= \
-            IPHONEOS_DEPLOYMENT_TARGET=26.0 \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=NO \
-            build 2>&1 | tee output/build.log
+        code = r'''import Photos
+        import SwiftUI
+        import UIKit
 
-      - name: Package unsigned IPA
-        run: |
-          set -euo pipefail
-          app="$RUNNER_TEMP/niuma-derived/Build/Products/Release-iphoneos/niuma.app"
-          test -d "$app"
-          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
-          platform=$(/usr/libexec/PlistBuddy -c 'Print :DTPlatformName' "$app/Info.plist")
-          test "$platform" = iphoneos
-          xcrun lipo "$app/$executable" -verify_arch arm64
-          if [[ -e "$app/_CodeSignature" || -e "$app/embedded.mobileprovision" ]]; then
-            echo "Unexpected signing data"
-            exit 1
-          fi
-          mkdir -p "$RUNNER_TEMP/niuma-package/Payload"
-          ditto "$app" "$RUNNER_TEMP/niuma-package/Payload/niuma.app"
-          ditto -c -k --keepParent \
-            "$RUNNER_TEMP/niuma-package/Payload" \
-            "$GITHUB_WORKSPACE/output/Niuma-unsigned.ipa"
-          unzip -t output/Niuma-unsigned.ipa
-          shasum -a 256 output/Niuma-unsigned.ipa > output/SHA256SUMS.txt
+        /// Exports the original cached image, independently from preview downsampling.
+        struct ImageExportActions: ViewModifier {
+            let data: Data?
+            let language: AppLanguage
+            var showsButton = false
 
-      - name: Upload IPA and logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Niuma-unsigned
-          path: output/
-          if-no-files-found: warn
-          retention-days: 7
+            @State private var isSaving = false
+            @State private var resultMessage: String?
+            @State private var sharedImage: SharedImage?
+
+            private func label(_ chinese: String, _ english: String) -> String {
+                language == .chinese ? chinese : english
+            }
+
+            func body(content: Content) -> some View {
+                content
+                    .contextMenu {
+                        exportButtons
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if showsButton {
+                            Menu {
+                                exportButtons
+                            } label: {
+                                Image(systemName: "square.and.arrow.up")
+                                    .font(.title3.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .frame(width: 48, height: 48)
+                                    .background(.black.opacity(0.6), in: Circle())
+                            }
+                            .accessibilityLabel(label("保存或分享图片", "Save or share image"))
+                            .disabled(data == nil || isSaving)
+                            .padding(20)
+                        }
+                    }
+                    .alert(label("图片", "Image"), isPresented: Binding(
+                        get: { resultMessage != nil },
+                        set: { if !$0 { resultMessage = nil } }
+                    )) {
+                        Button(label("知道了", "OK"), role: .cancel) { resultMessage = nil }
+                    } message: {
+                        Text(resultMessage ?? "")
+                    }
+                    .sheet(item: $sharedImage) { item in
+                        ImageActivitySheet(image: item.image)
+                    }
+            }
+
+            @ViewBuilder private var exportButtons: some View {
+                Button {
+                    Task { await saveOriginalImage() }
+                } label: {
+                    Label(label(isSaving ? "正在保存…" : "保存到相册", isSaving ? "Saving…" : "Save to Photos"), systemImage: "square.and.arrow.down")
+                }
+                .disabled(data == nil || isSaving)
+
+                Button {
+                    guard let data, let original = UIImage(data: data) else {
+                        resultMessage = label("图片尚未下载完成，请稍后重试。", "The image is not available yet. Please try again.")
+                        return
+                    }
+                    sharedImage = SharedImage(image: original)
+                } label: {
+                    Label(label("分享图片", "Share image"), systemImage: "square.and.arrow.up")
+                }
+                .disabled(data == nil || isSaving)
+            }
+
+            @MainActor private func saveOriginalImage() async {
+                guard !isSaving, let data else { return }
+                isSaving = true
+                defer { isSaving = false }
+                let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+                guard status == .authorized || status == .limited else {
+                    resultMessage = label("未获得相册添加权限。请到系统设置中允许 Niuma 添加照片。", "Photo access was denied. Allow Niuma to add photos in Settings.")
+                    return
+                }
+                do {
+                    // Add the exact original bytes, retaining dimensions and metadata.
+                    try await PHPhotoLibrary.shared().performChanges {
+                        let request = PHAssetCreationRequest.forAsset()
+                        request.addResource(with: .photo, data: data, options: nil)
+                    }
+                    resultMessage = label("已保存到相册。", "Saved to Photos.")
+                } catch {
+                    resultMessage = label("保存失败：", "Could not save: ") + error.localizedDescription
+                }
+            }
+        }
+
+        private struct SharedImage: Identifiable {
+            let id = UUID()
+            let image: UIImage
+        }
+
+        private struct ImageActivitySheet: UIViewControllerRepresentable {
+            let image: UIImage
+
+            func makeUIViewController(context: Context) -> UIActivityViewController {
+                UIActivityViewController(activityItems: [image], applicationActivities: nil)
+            }
+
+            func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+        }
+        '''
+        (root / 'niuma/Features/Threads/ImageExportActions.swift').write_text(code, encoding='utf-8')
+        path = root / 'niuma.xcodeproj/project.pbxproj'
+        text = path.read_text(encoding='utf-8')
+        anchor = '\t\t\t\tINFOPLIST_KEY_NSCameraUsageDescription = '
+        lines = text.splitlines(keepends=True)
+        output = []
+        count = 0
+        for line in lines:
+            output.append(line)
+            if line.startswith(anchor):
+                output.append('\t\t\t\tINFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "用于将你选择的图片保存到系统相册";\n')
+                count += 1
+        assert count == 2
+        path.write_text(''.join(output), encoding='utf-8')
+        PY
+    - name: Select Xcode and record source
+      run: |
+        set -euo pipefail
+        mkdir -p output
+        if [[ -d /Applications/Xcode_26.4.1.app ]]; then
+          sudo xcode-select --switch /Applications/Xcode_26.4.1.app/Contents/Developer
+        fi
+        xcodebuild -version | tee output/xcode-version.txt
+        xcrun --sdk iphoneos --show-sdk-version
+        git -C source rev-parse HEAD > output/source-commit.txt
+    - name: Build for physical iPhone without signing
+      run: |
+        set -euo pipefail
+        xcodebuild \
+          -project source/niuma-ios/niuma.xcodeproj \
+          -scheme niuma \
+          -configuration Release \
+          -sdk iphoneos \
+          -destination 'generic/platform=iOS' \
+          -derivedDataPath "$RUNNER_TEMP/niuma-derived" \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY= \
+          DEVELOPMENT_TEAM= \
+          IPHONEOS_DEPLOYMENT_TARGET=26.0 \
+          ARCHS=arm64 \
+          ONLY_ACTIVE_ARCH=NO \
+          build 2>&1 | tee output/build.log
+    - name: Verify device build and package unsigned IPA
+      run: |
+        set -euo pipefail
+        app="$RUNNER_TEMP/niuma-derived/Build/Products/Release-iphoneos/niuma.app"
+        test -d "$app"
+        executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
+        platform=$(/usr/libexec/PlistBuddy -c 'Print :DTPlatformName' "$app/Info.plist")
+        test "$platform" = iphoneos
+        xcrun lipo "$app/$executable" -verify_arch arm64
+        if [[ -e "$app/_CodeSignature" || -e "$app/embedded.mobileprovision" ]]; then
+          echo 'Unexpected signing data in unsigned build.' >&2
+          exit 1
+        fi
+        stage="$RUNNER_TEMP/niuma-ipa"
+        mkdir -p "$stage/Payload"
+        ditto "$app" "$stage/Payload/niuma.app"
+        ditto -c -k --keepParent "$stage/Payload" "$GITHUB_WORKSPACE/output/Niuma-unsigned.ipa"
+        unzip -t output/Niuma-unsigned.ipa
+        shasum -a 256 output/Niuma-unsigned.ipa > output/SHA256SUMS.txt
+        /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist" > output/minimum-ios-version.txt
+        printf '%s\n' \
+          'Unsigned physical-device IPA. Sign on iPhone before installing.' \
+          'Minimum iOS version: 26.0.' \
+          'Push notifications require compatible signing entitlements and server APNs configuration.' \
+          > output/INSTALL.txt
+        printf '%s\n' \
+          '### Niuma unsigned IPA' \
+          'Download the Niuma-unsigned artifact below and extract Niuma-unsigned.ipa.' \
+          'Sign the IPA using your on-device signing tool. Minimum iOS: 26.0.' \
+          >> "$GITHUB_STEP_SUMMARY"
+    - name: Upload IPA and diagnostic logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Niuma-unsigned
+        path: output/
+        if-no-files-found: warn
+        retention-days: 7
+'on':
+  workflow_dispatch: null
