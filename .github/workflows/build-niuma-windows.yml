@@ -402,6 +402,80 @@ jobs:
         text = text.replace(anchor, test + anchor)
         path.write_text(text, encoding='utf-8')
         PY
+    - name: Keep pairing responsive during metadata sync
+      shell: bash
+      run: |
+        python <<'PY'
+        from pathlib import Path
+
+        path = Path('source/niuma-cli/src/realtime.rs')
+        text = path.read_text(encoding='utf-8')
+        old = '''    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+            loop {'''
+        new = '''    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+            let (metadata_tx, mut metadata_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut metadata_waiters: Vec<MetadataRefreshMessage> = Vec::new();
+            let mut metadata_busy = false;
+            loop {'''
+        assert text.count(old) == 1
+        text = text.replace(old, new)
+        old = '''                let value: serde_json::Value = serde_json::from_str(&text)?;
+                        handle_server_payload(&mut writer, runtime, value).await?;'''
+        new = '''                let value: serde_json::Value = serde_json::from_str(&text)?;
+                        if wire_kind(&value) == "metadata_refresh" {
+                            let inbound: MetadataRefreshMessage = serde_json::from_value(value)?;
+                            // Coalesce periodic refreshes for a device while a snapshot
+                            // is in flight. Only this loop owns the websocket writer.
+                            metadata_waiters.retain(|old| old.device_id != inbound.device_id);
+                            metadata_waiters.push(inbound);
+                            if !metadata_busy {
+                                metadata_busy = true;
+                                let sender = metadata_tx.clone();
+                                let app_server = runtime.codex_app_server.clone();
+                                tokio::spawn(async move {
+                                    let result = match app_server {
+                                        Some(client) => CodexMetadataProjector::new(client).snapshot().await,
+                                        None => Err(anyhow::anyhow!("Codex app-server is unavailable")),
+                                    };
+                                    let _ = sender.send(result);
+                                });
+                            }
+                            continue;
+                        }
+                        handle_server_payload(&mut writer, runtime, value).await?;'''
+        assert text.count(old) == 1
+        text = text.replace(old, new)
+        anchor = '''            notification = next_notification(&mut notifications), if notifications.is_some() => {'''
+        branch = '''            Some(result) = metadata_rx.recv(), if metadata_busy => {
+                        metadata_busy = false;
+                        match result {
+                            Ok(snapshot) => {
+                                for message in metadata::snapshot_wire_messages(&snapshot) {
+                                    send_wire_message(&mut writer, message).await?;
+                                }
+                                for inbound in metadata_waiters.drain(..) {
+                                    send_wire_message(&mut writer, metadata_refresh_completed_wire(&inbound, &snapshot)).await?;
+                                }
+                                info!(project_count = snapshot.projects.len(),
+                                    thread_count = snapshot.threads.len(), "gateway_metadata_refresh_done");
+                                start_ready_queued_tasks(&mut writer, runtime).await?;
+                            }
+                            Err(error) => {
+                                for inbound in metadata_waiters.drain(..) {
+                                    send_wire_message(&mut writer, json!({
+                                        "kind": "metadata_refresh_failed", "device_id": inbound.device_id,
+                                        "request_id": inbound.request_id, "error": error.to_string(),
+                                    })).await?;
+                                }
+                                warn!("metadata_refresh_failed: {error:#}");
+                            }
+                        }
+                    }
+        '''
+        assert text.count(anchor) == 1
+        text = text.replace(anchor, branch + anchor)
+        path.write_text(text, encoding='utf-8')
+        PY
     - name: Select stable Rust
       run: |
         rustup update stable --no-self-update
