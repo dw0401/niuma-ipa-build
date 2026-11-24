@@ -426,7 +426,7 @@ jobs:
                             let inbound: MetadataRefreshMessage = serde_json::from_value(value)?;
                             // Coalesce periodic refreshes for a device while a snapshot
                             // is in flight. Only this loop owns the websocket writer.
-                            metadata_waiters.retain(|old| old.device_id != inbound.device_id);
+                            metadata_waiters.retain(|old| old.device_id != inbound.device_id || old.request_id != inbound.request_id);
                             metadata_waiters.push(inbound);
                             if !metadata_busy {
                                 metadata_busy = true;
