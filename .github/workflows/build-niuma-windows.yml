@@ -294,6 +294,114 @@ jobs:
         text = text.replace('.filename_suffix("jsonl")', '.filename_suffix("jsonl")\n        .max_log_files(3)')
         path.write_text(text, encoding='utf-8')
         PY
+    - name: Skip stale projectless references without dropping valid projects
+      shell: bash
+      run: |
+        python <<'PY'
+        from pathlib import Path
+
+        path = Path('source/niuma-cli/src/metadata.rs')
+        text = path.read_text(encoding='utf-8')
+        old = '''            let raw = self
+                        .app_server
+                        .read_thread_payload(&thread_id, false)
+                        .await
+                        .with_context(|| format!("failed to read projectless thread {thread_id}"))?;'''
+        new = '''            let raw = match self.app_server.read_thread_payload(&thread_id, false).await {
+                        Ok(raw) => raw,
+                        Err(error) if is_stale_projectless_reference(&error, &thread_id) => {
+                            tracing::debug!(thread_id, "skipping stale Codex projectless reference");
+                            continue;
+                        }
+                        Err(error) => return Err(error)
+                            .with_context(|| format!("failed to read projectless thread {thread_id}")),
+                    };'''
+        assert text.count(old) == 1
+        text = text.replace(old, new)
+        anchor = 'fn empty_state() -> CodexGlobalState {'
+        helper = '''// A stale saved id must not make the complete workspace snapshot fail.
+        // Only explicit Codex missing-thread responses are skipped, not transport,
+        // authentication, decoding or unrelated app-server failures.
+        fn is_stale_projectless_reference(error: &anyhow::Error, thread_id: &str) -> bool {
+            let Ok(response) = serde_json::from_str::<Value>(&error.to_string()) else {
+                return false;
+            };
+            if response.get("code").and_then(Value::as_i64) != Some(-32600) {
+                return false;
+            }
+            let Some(message) = response.get("message").and_then(Value::as_str) else {
+                return false;
+            };
+            message == format!("thread not loaded: {thread_id}")
+                || message == format!("no rollout found for thread id {thread_id}")
+        }
+
+        '''
+        assert text.count(anchor) == 1
+        text = text.replace(anchor, helper + anchor)
+        anchor = '    #[test]\n    fn workspace_store_orders_and_deduplicates_roots()'
+        test = r'''    #[test]
+            fn stale_projectless_reference_preserves_other_errors() {
+                for message in ["thread not loaded: gone", "no rollout found for thread id gone"] {
+                    let error = anyhow::anyhow!(json!({"code": -32600, "message": message}).to_string());
+                    assert!(is_stale_projectless_reference(&error, "gone"));
+                    assert!(!is_stale_projectless_reference(&error, "different"));
+                }
+                for message in ["permission denied", "app-server request timed out", "thread not loaded: gone"] {
+                    let error = anyhow::anyhow!(message.to_string());
+                    assert!(!is_stale_projectless_reference(&error, "gone"));
+                }
+                let error = anyhow::anyhow!(json!({"code": -32603, "message": "thread not loaded: gone"}).to_string());
+                assert!(!is_stale_projectless_reference(&error, "gone"));
+            }
+
+            #[tokio::test]
+            async fn stale_projectless_reference_does_not_abort_snapshot() {
+                crate::paths::ensure_state_dirs().unwrap();
+                let root = std::env::temp_dir().join(format!("niuma-stale-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&root).unwrap();
+                let script = root.join("server.py");
+                std::fs::write(&script, r#"
+        import json, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            if 'id' not in request:
+                continue
+            method = request['method']
+            if method == 'thread/read' and request['params']['threadId'] == 'gone':
+                response = {'error': {'code': -32600, 'message': 'thread not loaded: gone'}}
+            elif method == 'thread/read':
+                response = {'result': {'thread': {'id': 'good', 'preview': 'Valid thread', 'turns': []}}}
+            elif method in ['model/list', 'models/list']:
+                response = {'result': {'data': []}}
+            else:
+                response = {'result': {}}
+            response['id'] = request['id']
+            print(json.dumps(response), flush=True)
+        "#).unwrap();
+                let state_path = root.join("state.json");
+                let original = json!({"projectless-thread-ids": ["gone", "good"]}).to_string();
+                std::fs::write(&state_path, &original).unwrap();
+                let client = CodexAppServerClient::start(&[
+                    "python".into(), script.to_string_lossy().into_owned()
+                ]).await.unwrap();
+                let projector = CodexMetadataProjector {
+                    app_server: client,
+                    workspace_store: CodexWorkspaceStore { global_state_path: state_path.clone() },
+                };
+                let snapshot = projector.snapshot().await.unwrap();
+                assert_eq!(snapshot.threads.len(), 1);
+                assert_eq!(snapshot.threads[0].thread_id, "good");
+                assert_eq!(std::fs::read_to_string(&state_path).unwrap(), original);
+                drop(projector);
+                let _ = std::fs::remove_dir_all(root);
+            }
+
+        '''
+        assert text.count(anchor) == 1
+        text = text.replace(anchor, test + anchor)
+        path.write_text(text, encoding='utf-8')
+        PY
     - name: Select stable Rust
       run: |
         rustup update stable --no-self-update
@@ -313,6 +421,10 @@ jobs:
     - name: Test read-only replay and notification feedback regression
       run: |
         cargo test --locked --manifest-path source/niuma-cli/Cargo.toml history_replay_ -- --test-threads=1
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    - name: Test stale thread recovery and error handling
+      run: |
+        cargo test --locked --manifest-path source/niuma-cli/Cargo.toml stale_projectless_reference -- --test-threads=1
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Build Windows gateway
       run: |
