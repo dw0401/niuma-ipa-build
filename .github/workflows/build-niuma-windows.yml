@@ -488,20 +488,24 @@ jobs:
         old = r'data:image/[^>]+|file://[^>]+|/[^>]+'
         new = r'data:image/[^>]+|file://[^>]+|[A-Za-z]:[\/][^>]+|/[^>]+'
         assert s.count(old) == 1
+        new = new.replace('[' + chr(92) + '/]', '[' + chr(92) * 2 + '/]')
         s = s.replace(old, new)
         old = r'data:image/[^)]+|file://[^)]+|/[^)]+'
         new = r'data:image/[^)]+|file://[^)]+|[A-Za-z]:[\/][^)]+|/[^)]+'
         assert s.count(old) == 1
+        new = new.replace('[' + chr(92) + '/]', '[' + chr(92) * 2 + '/]')
         s = s.replace(old, new)
         old = '''    } else if raw_url.starts_with('/') {
                 raw_url.to_string()'''
         new = '''    } else if raw_url.starts_with('/') || std::path::Path::new(raw_url).is_absolute() {
                 raw_url.to_string()'''
         assert s.count(old) == 1
+        new = new.replace('[' + chr(92) + '/]', '[' + chr(92) * 2 + '/]')
         s = s.replace(old, new)
         old = r'(?P<ref>file://[^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp)|/[^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp))'
         new = r'(?P<ref>file://[^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp)|[A-Za-z]:[\/][^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp)|/[^\s<>\]\)]+?\.(?i:png|jpe?g|gif|webp))'
         assert s.count(old) == 1
+        new = new.replace('[' + chr(92) + '/]', '[' + chr(92) * 2 + '/]')
         s = s.replace(old, new)
         anchor = '    #[test]\n    fn markdown_local_image_link_becomes_file_ref()'
         test = r'''    #[cfg(windows)]
@@ -554,6 +558,7 @@ jobs:
                                     && part.get("data_url").and_then(Value::as_str).is_some()))))
                         .map(|event| event.into_wire(&message.device_id))'''
         assert s.count(old) == 1
+        new = new.replace('[' + chr(92) + '/]', '[' + chr(92) * 2 + '/]')
         s = s.replace(old, new)
         p.write_text(s, encoding='utf-8')
 
@@ -567,6 +572,7 @@ jobs:
                 .max(fallback_cursor)
         }'''
         assert s.count(old) == 1
+        new = new.replace('[' + chr(92) + '/]', '[' + chr(92) * 2 + '/]')
         s = s.replace(old, new)
         anchor = '    #[test]\n    fn agent_ws_url_preserves_reverse_proxy_prefix()'
         test = '''    #[test]
