@@ -587,6 +587,83 @@ jobs:
         s = s.replace(anchor, test + anchor)
         p.write_text(s, encoding='utf-8')
         PY
+    - name: Transfer native imageGeneration results in assistant replies
+      shell: bash
+      run: |
+        python <<'PY'
+        from pathlib import Path
+
+        p = Path('source/niuma-cli/src/codex_projection.rs')
+        s = p.read_text(encoding='utf-8')
+        anchor = '''    if let Some(input_text) = turn_input_text(turn, &entries)'''
+        code = '''    // app-server exposes native image generation as its own result, even
+            // when the final assistant text has no Markdown link. Enrich the existing
+            // final row to preserve entry identities and replay sequence numbers.
+            let mut generated_images = Vec::new();
+            for item in &items {
+                if item.get("type").and_then(Value::as_str) != Some("imageGeneration")
+                    || item.get("status").and_then(Value::as_str) != Some("completed") {
+                    continue;
+                }
+                if let Some(result) = item.get("result").and_then(Value::as_str) {
+                    let data_url = if result.starts_with("data:image/") {
+                        result.to_string()
+                    } else { format!("data:image/png;base64,{result}") };
+                    if let Some(part) = file_part_from_data_url(&data_url, None, Some("Generated image")) {
+                        push_unique_file_part(&mut generated_images, part);
+                    }
+                }
+            }
+            if !generated_images.is_empty() {
+                if let Some(entry) = entries.iter_mut().rev()
+                    .find(|entry| entry.role == "assistant" && entry.item_type == "agentMessage") {
+                    let mut parts = crate::transfers::decode_content_parts_payload(&entry.text)
+                        .unwrap_or_else(|| content_parts_from_text(&entry.text));
+                    for image in generated_images { push_unique_file_part(&mut parts, image); }
+                    entry.text = encode_content_parts_payload(&parts);
+                } else {
+                    let item_id = items.iter().rev()
+                        .find(|item| item.get("type").and_then(Value::as_str) == Some("imageGeneration"))
+                        .and_then(|item| string_field(item, "id")).unwrap_or_else(|| "generated-image".into());
+                    entries.push(ThreadEntry {
+                        entry_id: format!("{turn_id}-{item_id}"), role: "assistant".into(),
+                        text: encode_content_parts_payload(&generated_images),
+                        item_type: "agentMessage".into(), phase: Some("final_answer".into()),
+                    });
+                }
+            }
+        '''
+        assert s.count(anchor) == 1
+        s = s.replace(anchor, code + anchor)
+        anchor = '    #[test]\n    fn markdown_local_image_link_becomes_file_ref()'
+        test = r'''    #[test]
+            fn native_image_generation_enriches_final_reply_without_new_sequence() {
+                let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0";
+                let result = STANDARD.encode(png);
+                let turn = json!({"id":"turn-one", "items":[
+                    {"id":"user", "type":"userMessage", "content":[{"type":"input_text", "text":"Generate image"}]},
+                    {"id":"image", "type":"imageGeneration", "status":"completed", "result":result},
+                    {"id":"reply", "type":"agentMessage", "phase":"final_answer", "text":"Generated as requested."}
+                ]});
+                let entries = extract_turn_entries(&turn, None);
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[1].entry_id, "turn-one-reply");
+                let parts = crate::transfers::decode_content_parts_payload(&entries[1].text).unwrap();
+                assert!(parts.iter().any(|part| part["file_type"] == "image"));
+                assert!(parts.iter().any(|part| part["text"] == "Generated as requested."));
+                let mut invalid = turn.clone();
+                invalid["items"][1]["result"] = json!("invalid-base64");
+                assert_eq!(extract_turn_entries(&invalid, None)[1].text, "Generated as requested.");
+                let mut pending = turn;
+                pending["items"][1]["status"] = json!("inProgress");
+                assert_eq!(extract_turn_entries(&pending, None)[1].text, "Generated as requested.");
+            }
+
+        '''
+        assert s.count(anchor) == 1
+        s = s.replace(anchor, test + anchor)
+        p.write_text(s, encoding='utf-8')
+        PY
     - name: Select stable Rust
       run: |
         rustup update stable --no-self-update
@@ -618,6 +695,10 @@ jobs:
         cargo test --locked --manifest-path source/niuma-cli/Cargo.toml markdown_local_image_link -- --test-threads=1
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         cargo test --locked --manifest-path source/niuma-cli/Cargo.toml enriched_image_rows -- --test-threads=1
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    - name: Test native image generation and actual-thread fixture
+      run: |
+        cargo test --locked --manifest-path source/niuma-cli/Cargo.toml native_image_generation -- --test-threads=1
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     - name: Build Windows gateway
       run: |
